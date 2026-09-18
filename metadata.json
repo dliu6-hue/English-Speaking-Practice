@@ -1,0 +1,6 @@
+{
+  "name": "English Speaking Practice",
+  "description": "AI-powered English shadowing and pronunciation practice app with automatic sentence splitting, recording, and feedback.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
