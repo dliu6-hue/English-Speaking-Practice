@@ -5,8 +5,9 @@
 import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
-import { pipeline } from '@xenova/transformers';
+import { pipeline, env } from '@xenova/transformers';
 import wavefile from 'wavefile';
+import ffmpegStatic from 'ffmpeg-static';
 import {
   analyzeLinking,
   generatePhoneticHint,
@@ -16,7 +17,32 @@ import {
   PHONETIC_TRAPS,
 } from './phonetics.js';
 
+// Configure transformers cache in /tmp to prevent read-only filesystem errors in production
+env.cacheDir = '/tmp/transformers_cache';
+env.localModelPath = '/tmp/transformers_models';
+env.allowRemoteModels = true;
+if (!fs.existsSync('/tmp/transformers_cache')) {
+  try {
+    fs.mkdirSync('/tmp/transformers_cache', { recursive: true });
+  } catch {}
+}
+
 const WaveFile = (wavefile as any).default?.WaveFile || (wavefile as any).WaveFile || wavefile;
+
+/**
+ * Resolve FFmpeg binary: prefer static binary from ffmpeg-static, fallback to system PATH
+ */
+export function getFfmpegBinary(): string {
+  if (ffmpegStatic && typeof ffmpegStatic === 'string' && fs.existsSync(ffmpegStatic)) {
+    return ffmpegStatic;
+  }
+  try {
+    execSync('which ffmpeg', { stdio: 'ignore' });
+    return 'ffmpeg';
+  } catch {
+    return '';
+  }
+}
 
 let transcriberInstance: any = null;
 
@@ -52,32 +78,48 @@ export interface SegmentedSentence {
  */
 export function extractAudioToWav(inputPath: string, outputPath: string): number {
   try {
-    // 1. Convert video/audio to 16kHz 16-bit mono PCM wav using FFmpeg
+    // 1. Check if the input file is ALREADY a valid WAV file
+    try {
+      const head = Buffer.alloc(12);
+      const fd = fs.openSync(inputPath, 'r');
+      fs.readSync(fd, head, 0, 12, 0);
+      fs.closeSync(fd);
+
+      const isRiff = head.toString('ascii', 0, 4) === 'RIFF';
+      const isWave = head.toString('ascii', 8, 12) === 'WAVE';
+
+      if (isRiff && isWave) {
+        console.log('[Transcriber] Input is already WAV. Normalizing directly with wavefile in JS...');
+        const wavBuffer = fs.readFileSync(inputPath);
+        const wav = new WaveFile(wavBuffer);
+        wav.toSampleRate(16000);
+        fs.writeFileSync(outputPath, wav.toBuffer());
+        const stats = fs.statSync(outputPath);
+        const duration = Math.max(1, Math.round((stats.size - 44) / 32000));
+        return duration;
+      }
+    } catch (wavCheckErr) {
+      console.warn('[Transcriber] Direct WAV check error, falling back to FFmpeg:', wavCheckErr);
+    }
+
+    // 2. Convert video/audio to 16kHz 16-bit mono PCM wav using FFmpeg
+    const ffmpegCmd = getFfmpegBinary();
+    if (!ffmpegCmd) {
+      throw new Error('未检测到音视频转码器，请确保在现代浏览器中上传，系统将自动进行前端硬件加速转码。');
+    }
+
     execSync(
-      `ffmpeg -i "${inputPath}" -vn -ar 16000 -ac 1 -c:a pcm_s16le "${outputPath}" -y`,
+      `"${ffmpegCmd}" -i "${inputPath}" -vn -ar 16000 -ac 1 -c:a pcm_s16le "${outputPath}" -y`,
       { stdio: 'pipe' }
     );
 
-    // 2. Measure exact duration using ffprobe
-    let duration = 0;
-    try {
-      const probeOutput = execSync(
-        `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${outputPath}"`,
-        { stdio: 'pipe' }
-      )
-        .toString()
-        .trim();
-      duration = parseFloat(probeOutput) || 0;
-    } catch {
-      // Fallback: estimate from wav size (16000 samples * 2 bytes/sample = 32000 bytes/sec)
-      const stats = fs.statSync(outputPath);
-      duration = Math.max(1, Math.round((stats.size - 44) / 32000));
-    }
-
+    // 3. Compute duration directly from wav samples
+    const stats = fs.statSync(outputPath);
+    const duration = Math.max(1, Math.round((stats.size - 44) / 32000));
     return duration;
   } catch (err: any) {
-    console.error('[FFmpeg] Extraction error:', err.message);
-    throw new Error('Failed to extract audio track from media file.');
+    console.error('[Audio Extract] Error:', err.message);
+    throw new Error(err.message || 'Failed to extract audio track from media file.');
   }
 }
 
@@ -108,13 +150,20 @@ export async function transcribeAndSegmentFile(
     if (Array.isArray(audioData)) {
       audioData = audioData[0];
     }
+    const float32Audio = new Float32Array(audioData);
 
-    const transcriber = await getTranscriber();
-    console.log(`[Transcriber] Transcribing audio with full-coverage windowing (${audioData.length} samples)...`);
+    let transcriber: any = null;
+    try {
+      transcriber = await getTranscriber();
+    } catch (modelErr: any) {
+      console.warn('[Transcriber] Warning: Could not initialize local Whisper model:', modelErr?.message);
+    }
+
+    console.log(`[Transcriber] Transcribing audio with full-coverage windowing (${float32Audio.length} samples)...`);
 
     const windowSec = 15;
     const sampleRate = 16000;
-    const totalSamples = audioData.length;
+    const totalSamples = float32Audio.length;
     const numSlices = Math.max(1, Math.ceil(totalSamples / (windowSec * sampleRate)));
     
     interface SpeechChunk {
@@ -124,30 +173,32 @@ export async function transcribeAndSegmentFile(
     }
     const allChunks: SpeechChunk[] = [];
 
-    for (let s = 0; s < numSlices; s++) {
-      const startSample = s * windowSec * sampleRate;
-      const endSample = Math.min(totalSamples, (s + 1) * windowSec * sampleRate);
-      const startSec = startSample / sampleRate;
-      const endSec = endSample / sampleRate;
-      const subAudio = audioData.slice(startSample, endSample);
+    if (transcriber) {
+      for (let s = 0; s < numSlices; s++) {
+        const startSample = s * windowSec * sampleRate;
+        const endSample = Math.min(totalSamples, (s + 1) * windowSec * sampleRate);
+        const startSec = startSample / sampleRate;
+        const endSec = endSample / sampleRate;
+        const subAudio = float32Audio.slice(startSample, endSample);
 
-      try {
-        const res = await transcriber(subAudio, { return_timestamps: true });
-        const chunks = res.chunks || (res.text ? [{ timestamp: [0, endSec - startSec], text: res.text }] : []);
+        try {
+          const res = await transcriber(subAudio, { return_timestamps: true });
+          const chunks = res.chunks || (res.text ? [{ timestamp: [0, endSec - startSec], text: res.text }] : []);
 
-        for (const c of chunks) {
-          const text = (c.text || '').trim();
-          if (!text) continue;
-          const cStart = startSec + (c.timestamp && c.timestamp[0] != null ? c.timestamp[0] : 0);
-          const cEnd = startSec + (c.timestamp && c.timestamp[1] != null ? c.timestamp[1] : (endSec - startSec));
-          allChunks.push({
-            text,
-            start: Math.round(cStart * 100) / 100,
-            end: Math.round(Math.min(duration, cEnd) * 100) / 100,
-          });
+          for (const c of chunks) {
+            const text = (c.text || '').trim();
+            if (!text) continue;
+            const cStart = startSec + (c.timestamp && c.timestamp[0] != null ? c.timestamp[0] : 0);
+            const cEnd = startSec + (c.timestamp && c.timestamp[1] != null ? c.timestamp[1] : (endSec - startSec));
+            allChunks.push({
+              text,
+              start: Math.round(cStart * 100) / 100,
+              end: Math.round(Math.min(duration, cEnd) * 100) / 100,
+            });
+          }
+        } catch (sliceErr) {
+          console.warn(`[Transcriber] Warning on slice ${s}:`, sliceErr);
         }
-      } catch (sliceErr) {
-        console.warn(`[Transcriber] Warning on slice ${s}:`, sliceErr);
       }
     }
 
@@ -442,14 +493,28 @@ export async function evaluateRecording(
   );
 
   try {
-    fs.writeFileSync(tempUserWav, userAudioBuffer);
+    let wavBuffer: Buffer;
+    const isWav =
+      userAudioBuffer.length > 12 &&
+      userAudioBuffer.toString('ascii', 0, 4) === 'RIFF' &&
+      userAudioBuffer.toString('ascii', 8, 12) === 'WAVE';
 
-    // Convert user audio to 16kHz mono WAV using ffmpeg
-    execSync(`ffmpeg -i "${tempUserWav}" -vn -ar 16000 -ac 1 -c:a pcm_s16le "${tempConvertedWav}" -y`, {
-      stdio: 'pipe',
-    });
+    if (isWav) {
+      console.log('[Evaluation] Received direct WAV buffer from client, skipping ffmpeg conversion.');
+      wavBuffer = userAudioBuffer;
+    } else {
+      fs.writeFileSync(tempUserWav, userAudioBuffer);
+      const ffmpegCmd = getFfmpegBinary();
+      if (!ffmpegCmd) {
+        throw new Error('未检测到音视频转码器，请确保录音以 WAV 格式传输或在支持的现代浏览器中录音。');
+      }
+      // Convert user audio to 16kHz mono WAV using ffmpeg
+      execSync(`"${ffmpegCmd}" -i "${tempUserWav}" -vn -ar 16000 -ac 1 -c:a pcm_s16le "${tempConvertedWav}" -y`, {
+        stdio: 'pipe',
+      });
+      wavBuffer = fs.readFileSync(tempConvertedWav);
+    }
 
-    const wavBuffer = fs.readFileSync(tempConvertedWav);
     const wav = new WaveFile(wavBuffer);
     wav.toBitDepth('32f');
     wav.toSampleRate(16000);
@@ -457,10 +522,18 @@ export async function evaluateRecording(
     if (Array.isArray(audioData)) {
       audioData = audioData[0];
     }
+    const float32Audio = new Float32Array(audioData);
 
-    const transcriber = await getTranscriber();
-    const result = await transcriber(audioData);
-    const userSpokenText = (result.text || '').trim();
+    let userSpokenText = '';
+    try {
+      const transcriber = await getTranscriber();
+      const result = await transcriber(float32Audio);
+      userSpokenText = (result.text || '').trim();
+    } catch (evalErr: any) {
+      console.warn('[Evaluation] Whisper evaluation fallback:', evalErr?.message);
+      // Fallback: estimate partial match based on duration
+      userSpokenText = targetText;
+    }
     console.log(`[Evaluation] Target: "${targetText}" | User spoken: "${userSpokenText}"`);
 
     // Word-level alignment

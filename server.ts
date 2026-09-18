@@ -1,7 +1,6 @@
 import express from "express";
 import path from "path";
 import fs from "fs";
-import { createServer as createViteServer } from "vite";
 import dotenv from "dotenv";
 import multer from "multer";
 import { GoogleGenAI, Type } from "@google/genai";
@@ -13,7 +12,6 @@ import {
 
 dotenv.config();
 
-const PORT = 3000;
 const app = express();
 
 // Ensure upload directory exists
@@ -188,7 +186,12 @@ app.post("/api/analyze-pronunciation", async (req, res) => {
 
 // Vite / Static setup
 async function startServer() {
-  if (process.env.NODE_ENV !== "production") {
+  const isProduction =
+    process.env.NODE_ENV === "production" ||
+    (typeof __filename !== "undefined" && __filename.endsWith(".cjs"));
+
+  if (!isProduction) {
+    const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
@@ -202,8 +205,41 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+  // Cloud Run sets PORT (usually 8080) for health checks and ingress.
+  // In AI Studio development, the dev server must bind to port 3000 behind nginx.
+  const primaryPort =
+    isProduction && process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+
+  const server = app.listen(primaryPort, "0.0.0.0", () => {
+    console.log(
+      `Server running on http://0.0.0.0:${primaryPort} (${
+        isProduction ? "production" : "development"
+      })`
+    );
+  });
+
+  // If deployed in production and primaryPort is not 3000, also attach a secondary
+  // listener on 3000 if available, so both 8080 and 3000 respond to probes.
+  if (isProduction && primaryPort !== 3000) {
+    try {
+      const secondaryServer = app.listen(3000, "0.0.0.0", () => {
+        console.log("Secondary listener active on 0.0.0.0:3000");
+      });
+      secondaryServer.on("error", (e: any) => {
+        console.log(
+          `Secondary listener on port 3000 skipped (${e.code}). Primary is active on ${primaryPort}.`
+        );
+      });
+    } catch {
+      // Ignore secondary bind error
+    }
+  }
+
+  process.on("SIGTERM", () => {
+    console.log("SIGTERM received, closing HTTP server");
+    server.close(() => {
+      process.exit(0);
+    });
   });
 }
 

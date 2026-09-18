@@ -16,7 +16,7 @@ import {
   HelpCircle,
 } from 'lucide-react';
 import { SentenceItem, AudioLesson, PracticeRecord, AIFeedback } from '../types';
-import { speakText, blobToBase64, formatTime } from '../utils/audio';
+import { speakText, blobToBase64, formatTime, decodeAudioTo16kWavBlob } from '../utils/audio';
 
 interface SentencePracticeViewProps {
   lesson: AudioLesson;
@@ -235,7 +235,20 @@ export const SentencePracticeView: React.FC<SentencePracticeViewProps> = ({
   const analyzeRecording = async (blob: Blob, durationSec: number) => {
     setIsAnalyzing(true);
     try {
-      const base64 = await blobToBase64(blob);
+      // Pre-convert user recording to 16kHz mono WAV for instant analysis without backend transcoding
+      let finalBlob = blob;
+      let finalMimeType = blob.type || 'audio/webm';
+      try {
+        const wavResult = await decodeAudioTo16kWavBlob(blob);
+        if (wavResult && wavResult.wavBlob) {
+          finalBlob = wavResult.wavBlob;
+          finalMimeType = 'audio/wav';
+        }
+      } catch (wavErr) {
+        console.warn('WAV pre-encoding skipped:', wavErr);
+      }
+
+      const base64 = await blobToBase64(finalBlob);
 
       const res = await fetch('/api/analyze-pronunciation', {
         method: 'POST',
@@ -243,7 +256,7 @@ export const SentencePracticeView: React.FC<SentencePracticeViewProps> = ({
         body: JSON.stringify({
           originalText: sentence.text,
           userAudioBase64: base64,
-          mimeType: blob.type || 'audio/webm',
+          mimeType: finalMimeType,
           duration: durationSec || 3,
           sentenceId: sentence.id,
         }),
@@ -259,7 +272,7 @@ export const SentencePracticeView: React.FC<SentencePracticeViewProps> = ({
         sentenceId: sentence.id,
         audioBlobUrl: URL.createObjectURL(blob),
         audioBase64: base64,
-        mimeType: blob.type,
+        mimeType: finalMimeType,
         recordedAt: Date.now(),
         duration: durationSec,
         feedback: fb,

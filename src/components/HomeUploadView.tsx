@@ -14,7 +14,7 @@ import {
   FileCode,
 } from 'lucide-react';
 import { AudioLesson } from '../types';
-import { blobToBase64 } from '../utils/audio';
+import { blobToBase64, decodeAudioTo16kWavBlob } from '../utils/audio';
 
 interface HomeUploadViewProps {
   recentLessons: AudioLesson[];
@@ -78,8 +78,10 @@ export const HomeUploadView: React.FC<HomeUploadViewProps> = ({
     const mediaBlobUrl = isDoc ? '' : URL.createObjectURL(file);
 
     try {
-      // Step 1: Prepare & read basic metadata
+      // Step 1: Prepare & read basic metadata & pre-decode to 16kHz WAV for instant cloud compatibility
       let clientDuration = 0;
+      let preconvertedWav: Blob | null = null;
+
       if (!isDoc) {
         try {
           const mediaEl = document.createElement(isVideo ? 'video' : 'audio');
@@ -93,20 +95,39 @@ export const HomeUploadView: React.FC<HomeUploadViewProps> = ({
         } catch {
           // Fallback to server duration
         }
+
+        try {
+          // Use hardware-accelerated Web Audio API to decode and resample to 16kHz mono WAV
+          const decoded = await decodeAudioTo16kWavBlob(file);
+          if (decoded && decoded.wavBlob) {
+            preconvertedWav = decoded.wavBlob;
+            if (decoded.duration > 0) {
+              clientDuration = decoded.duration;
+            }
+          }
+        } catch (decErr) {
+          console.warn('[Upload] Client-side audio decoding fallback:', decErr);
+        }
       }
 
-      setProgressPercent(35);
+      setProgressPercent(45);
       setCurrentStepIndex(1); // Speech-to-Text with Whisper or doc parsing
 
-      // Upload via FormData for instant streaming without base64 overhead
+      // Upload via FormData with 16kHz WAV or original media
       const formData = new FormData();
-      formData.append('file', file);
+      if (preconvertedWav) {
+        formData.append('file', preconvertedWav, `${file.name.replace(/\.[^/.]+$/, '')}_16k.wav`);
+        formData.append('originalFilename', file.name);
+      } else {
+        formData.append('file', file);
+        formData.append('originalFilename', file.name);
+      }
       formData.append('filename', file.name);
       if (clientDuration > 0) {
         formData.append('duration', String(clientDuration));
       }
 
-      setProgressPercent(60);
+      setProgressPercent(65);
       setCurrentStepIndex(2); // Sentence Segmentation & Phonetics
 
       const response = await fetch('/api/process-audio', {
